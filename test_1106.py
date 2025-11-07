@@ -10,59 +10,62 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 import matplotlib.pyplot as plt
-import io
 
 class RobustQHampel:
     """
-    Q/Hampel方法的Streamlit实现
+    修改后的Q/Hampel方法实现，适用于多个实验室数据作为同一组输入的情况
     """
     
     def __init__(self):
         self.s_star = None
         self.robust_mean = None
-        self.lab_means = None
         self.original_data = None
     
     def parse_input_data(self, input_text):
         """
-        解析用户输入的文本数据
+        解析用户输入的文本数据，返回一维数组
         """
         try:
-            labs = input_text.split(';')
-            lab_data = []
-            
-            for i, lab in enumerate(labs):
-                measurements = [float(x.strip()) for x in lab.split(',') if x.strip()]
-                if len(measurements) < 1:
-                    st.warning(f"实验室 {i+1} 没有有效数据，已跳过")
-                    continue
-                lab_data.append(measurements)
-            
-            if len(lab_data) < 2:
-                st.error("至少需要2个实验室的数据")
-                return None
-            
-            return lab_data
+            # 处理可能的分号分隔符（多个实验室）
+            if ';' in input_text:
+                labs = input_text.split(';')
+                lab_data = []
+                
+                for i, lab in enumerate(labs):
+                    measurements = [float(x.strip()) for x in lab.split(',') if x.strip()]
+                    lab_data.extend(measurements)
+                
+                if len(lab_data) < 2:
+                    st.error("至少需要2个数据点")
+                    return None
+                
+                return lab_data
+            else:
+                # 处理逗号分隔的一维数据
+                data = [float(x.strip()) for x in input_text.split(',') if x.strip()]
+                
+                if len(data) < 2:
+                    st.error("至少需要2个数据点")
+                    return None
+                
+                return data
         except Exception as e:
             st.error(f"数据解析错误: {e}")
             return None
     
-    def calculate_q_method(self, lab_data):
+    def calculate_q_method(self, data):
         """
         Q方法计算稳健标准差 - 使用修正后的公式
+        适用于多个实验室数据作为同一组输入的情况
         """
         st.info("正在计算Q方法稳健标准差...")
         
         # 计算所有成对绝对差
-        all_data = []
-        for lab in lab_data:
-            all_data.extend(lab)
-        
         absolute_diffs = []
-        n = len(all_data)
+        n = len(data)
         for i in range(n):
             for j in range(i + 1, n):
-                diff = abs(all_data[i] - all_data[j])
+                diff = abs(data[i] - data[j])
                 if diff > 1e-10:  # 避免浮点数误差
                     absolute_diffs.append(diff)
         
@@ -132,6 +135,7 @@ class RobustQHampel:
         
         # 显示中间计算结果
         with st.expander("查看Q方法计算详情"):
+            st.write(f"数据点数量: {len(data)}")
             st.write(f"成对绝对差数量: {len(absolute_diffs)}")
             st.write(f"计算参数: a = {a:.4f}, b = {b:.4f}")
             st.write(f"G1_inv({a:.4f}) = {G1_inv_a:.6f}")
@@ -159,26 +163,25 @@ class RobustQHampel:
         else:
             return x_points[-1]
     
-    def calculate_hampel_method(self, lab_data, s_star):
+    def calculate_hampel_method(self, data, s_star):
         """
         Hampel方法计算稳健平均值
+        适用于多个实验室数据作为同一组输入的情况
         """
         st.info("正在计算Hampel方法稳健平均值...")
         
-        # 计算实验室均值
-        lab_means = [np.mean(lab) for lab in lab_data]
-        self.lab_means = lab_means
-        p = len(lab_means)
+        # 直接使用所有数据点，而不是实验室均值
+        p = len(data)
         
         # 生成插值节点
         nodes = []
-        for y in lab_means:
+        for y in data:
             offsets = [-4.5, -3.0, -1.5, 1.5, 3.0, 4.5]
             for offset in offsets:
                 nodes.append(y + offset * s_star)
         
         sorted_nodes = sorted(nodes)
-        median_val = np.median(lab_means)
+        median_val = np.median(data)
         
         # 寻找方程的解
         solutions = []
@@ -186,8 +189,8 @@ class RobustQHampel:
             d_m = sorted_nodes[m]
             d_m1 = sorted_nodes[m + 1]
             
-            P_m = sum(self._psi_function((y - d_m) / s_star) for y in lab_means)
-            P_m1 = sum(self._psi_function((y - d_m1) / s_star) for y in lab_means)
+            P_m = sum(self._psi_function((y - d_m) / s_star) for y in data)
+            P_m1 = sum(self._psi_function((y - d_m1) / s_star) for y in data)
             
             if abs(P_m) < 1e-10:
                 solutions.append(d_m)
@@ -233,34 +236,23 @@ class RobustQHampel:
         else:
             return 0.0
     
-    def calculate_traditional_stats(self, lab_data):
+    def calculate_traditional_stats(self, data):
         """计算传统统计量用于对比"""
-        all_data = []
-        for lab in lab_data:
-            all_data.extend(lab)
+        traditional_mean = np.mean(data)
+        traditional_std = np.std(data, ddof=1)  # 样本标准差
         
-        traditional_mean = np.mean(all_data)
-        traditional_std = np.std(all_data, ddof=1)  # 样本标准差
-        
-        lab_means = [np.mean(lab) for lab in lab_data]
-        between_lab_std = np.std(lab_means, ddof=1) if len(lab_means) > 1 else 0
-        
-        return traditional_mean, traditional_std, between_lab_std
+        return traditional_mean, traditional_std
     
-    def plot_comparison(self, lab_data):
+    def plot_comparison(self, data):
         """绘制结果对比图"""
-        if lab_data is None or self.lab_means is None:
+        if data is None:
             return
         
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
         
-        # 图1: 各实验室数据分布
-        all_data = []
-        for i, lab in enumerate(lab_data):
-            all_data.extend(lab)
-            ax1.scatter([i+1] * len(lab), lab, alpha=0.6, label=f'Lab {i+1}')
-        
-        traditional_mean = np.mean(all_data)
+        # 图1: 数据点分布
+        ax1.scatter(range(len(data)), data, alpha=0.6, color='blue')
+        traditional_mean = np.mean(data)
         ax1.axhline(y=traditional_mean, color='r', linestyle='--', 
                    label=f'传统均值: {traditional_mean:.3f}')
         
@@ -268,25 +260,20 @@ class RobustQHampel:
             ax1.axhline(y=self.robust_mean, color='g', linestyle='-', 
                        label=f'稳健均值: {self.robust_mean:.3f}')
         
-        ax1.set_xlabel('实验室编号')
+        ax1.set_xlabel('数据点索引')
         ax1.set_ylabel('测量值')
-        ax1.set_title('各实验室数据分布')
+        ax1.set_title('数据点分布')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # 图2: 实验室均值比较
-        lab_indices = range(1, len(self.lab_means) + 1)
-        ax2.bar(lab_indices, self.lab_means, alpha=0.7, color='skyblue')
-        ax2.axhline(y=traditional_mean, color='r', linestyle='--', 
-                   label=f'传统均值: {traditional_mean:.3f}')
-        
+        # 图2: 直方图
+        ax2.hist(data, bins=min(20, len(data)//5), alpha=0.7, color='skyblue', edgecolor='black')
+        ax2.axvline(traditional_mean, color='r', linestyle='--', label=f'传统均值: {traditional_mean:.3f}')
         if self.robust_mean is not None:
-            ax2.axhline(y=self.robust_mean, color='g', linestyle='-', 
-                       label=f'稳健均值: {self.robust_mean:.3f}')
-        
-        ax2.set_xlabel('实验室编号')
-        ax2.set_ylabel('实验室均值')
-        ax2.set_title('实验室均值比较')
+            ax2.axvline(self.robust_mean, color='g', linestyle='-', label=f'稳健均值: {self.robust_mean:.3f}')
+        ax2.set_xlabel('测量值')
+        ax2.set_ylabel('频数')
+        ax2.set_title('数据分布直方图')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         
@@ -305,7 +292,9 @@ def main():
     st.markdown("""
     本应用实现Q方法和Hampel方法，用于计算稳健的标准差和平均值，对异常值具有鲁棒性。
     
-    **Q方法**：基于实验室结果数据集的成对绝对差，直接估计重复性标准差和再现性标准差。
+    **特别说明**：本版本适用于多个实验室数据作为同一组输入的情况。
+    
+    **Q方法**：基于数据集的成对绝对差，直接估计重复性标准差和再现性标准差。
     
     **Hampel方法**：采用迭代加权法估计稳健平均值，通过回归残差大小确定各样本权重。
     """)
@@ -318,40 +307,38 @@ def main():
     
     input_method = st.sidebar.radio(
         "选择数据输入方式:",
-        ["手动输入", "使用演示数据", "上传CSV文件"]
+        ["手动输入", "使用演示数据"]
     )
     
-    lab_data = None
+    data = None
     
     if input_method == "手动输入":
         st.header("手动输入数据")
         st.markdown("""
         输入格式要求：
-        - 每个实验室的数据用**逗号**分隔
-        - 不同实验室用**分号**分隔
-        - 示例：`10.1,10.2,10.3;10.5,10.6,10.4;9.8,9.9,9.7`
+        - 所有数据用**逗号**分隔
+        - 示例：`-24,-24,-23,-23,-24,-23,-24,-23,-24,-24,-25,-23`
+        - 或者使用分号分隔多个实验室的数据：`-24,-24,-23,-23;-24,-23,-24,-23;-24,-24,-25,-23`
         """)
         
         input_text = st.text_area(
-            "输入实验室数据:",
-            value="10.1,10.2,10.3;10.5,10.6,10.4;9.8,9.9,9.7;10.7,10.8,10.6;9.5,9.6,9.4",
+            "输入数据:",
+            value="-24,-24,-23,-23,-24,-23,-24,-23,-24,-24,-25,-23,-23,-24,-24,-24,-24,-24,-23,-24,-23,-24,-24,-24,-24,-24,-24,-23,-24,-24,-23,-24,-24,-24,-24,-24,-24,-24,-24,-24,-24,-24,-25,-24,-22,-23,-23,-24,-24,-24,-24,-22,-24,-24,-24,-24,-25,-25,-24,-24,-23,-22,-24,-25,-23",
             height=100
         )
         
         if st.button("解析数据"):
-            lab_data = calculator.parse_input_data(input_text)
-            if lab_data:
-                st.success(f"成功解析 {len(lab_data)} 个实验室的数据")
+            data = calculator.parse_input_data(input_text)
+            if data:
+                st.success(f"成功解析 {len(data)} 个数据点")
                 
                 # 显示数据表格
                 data_display = []
-                for i, lab in enumerate(lab_data):
-                    for j, value in enumerate(lab):
-                        data_display.append({
-                            "实验室": f"Lab {i+1}",
-                            "测量序号": j+1,
-                            "测量值": value
-                        })
+                for i, value in enumerate(data):
+                    data_display.append({
+                        "数据点序号": i+1,
+                        "测量值": value
+                    })
                 
                 df = pd.DataFrame(data_display)
                 st.dataframe(df, use_container_width=True)
@@ -361,94 +348,47 @@ def main():
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    total_measurements = sum(len(lab) for lab in lab_data)
-                    st.metric("实验室数量", len(lab_data))
+                    st.metric("数据点数量", len(data))
                 
                 with col2:
-                    st.metric("总测量次数", total_measurements)
+                    st.metric("最小值", f"{min(data):.2f}")
                 
                 with col3:
-                    avg_measurements = total_measurements / len(lab_data)
-                    st.metric("平均每实验室测量次数", f"{avg_measurements:.1f}")
+                    st.metric("最大值", f"{max(data):.2f}")
     
     elif input_method == "使用演示数据":
         st.header("演示数据")
-        demo_data = [
-            [10.1, 10.2, 10.3, 10.15],
-            [10.5, 10.6, 10.4, 10.55],
-            [9.8, 9.9, 9.7, 9.85],
-            [10.7, 10.8, 10.6, 10.65],
-            [9.5, 9.6, 9.4, 9.45],
-            [10.3, 10.2, 10.4, 10.25]
-        ]
+        demo_data = [-24,-24,-23,-23,-24,-23,-24,-23,-24,-24,-25,-23,-23,-24,-24,-24,-24,-24,-23,-24,-23,-24,-24,-24,-24,-24,-24,-23,-24,-24,-23,-24,-24,-24,-24,-24,-24,-24,-24,-24,-24,-24,-25,-24,-22,-23,-23,-24,-24,-24,-24,-22,-24,-24,-24,-24,-25,-25,-24,-24,-23,-22,-24,-25,-23]
         
-        lab_data = demo_data
+        data = demo_data
         
         # 显示演示数据
         st.info("使用预定义的演示数据")
         data_display = []
-        for i, lab in enumerate(demo_data):
-            for j, value in enumerate(lab):
-                data_display.append({
-                    "实验室": f"Lab {i+1}",
-                    "测量序号": j+1,
-                    "测量值": value
-                })
+        for i, value in enumerate(demo_data):
+            data_display.append({
+                "数据点序号": i+1,
+                "测量值": value
+            })
         
         df = pd.DataFrame(data_display)
         st.dataframe(df, use_container_width=True)
     
-    elif input_method == "上传CSV文件":
-        st.header("上传CSV文件")
-        st.markdown("""
-        上传CSV文件格式要求：
-        - 每行代表一个实验室的数据
-        - 每列代表一次重复测量
-        - 文件应包含数值数据，表头可选
-        """)
-        
-        uploaded_file = st.file_uploader("选择CSV文件", type=['csv'])
-        
-        if uploaded_file is not None:
-            try:
-                df = pd.read_csv(uploaded_file)
-                st.success("文件上传成功！")
-                
-                # 显示数据预览
-                st.subheader("数据预览")
-                st.dataframe(df, use_container_width=True)
-                
-                # 转换为lab_data格式
-                lab_data = []
-                for i, row in df.iterrows():
-                    lab_measurements = [val for val in row if not pd.isna(val)]
-                    if len(lab_measurements) > 0:
-                        lab_data.append(lab_measurements)
-                
-                if len(lab_data) < 2:
-                    st.error("至少需要2个实验室的数据")
-                    lab_data = None
-                else:
-                    st.success(f"成功解析 {len(lab_data)} 个实验室的数据")
-            
-            except Exception as e:
-                st.error(f"文件读取错误: {e}")
-    
     # 计算按钮和结果显示
-    if lab_data is not None:
+    if data is not None:
         st.header("计算结果")
         
         if st.button("开始计算", type="primary"):
             # 创建计算进度区域
             with st.spinner("正在进行稳健统计计算..."):
                 # 计算传统统计量
-                trad_mean, trad_std, between_std = calculator.calculate_traditional_stats(lab_data)
+                trad_mean, trad_std = calculator.calculate_traditional_stats(data)
                 
                 # 计算Q方法
-                s_star = calculator.calculate_q_method(lab_data)
+                s_star = calculator.calculate_q_method(data)
                 
                 # 计算Hampel方法
-                robust_mean = calculator.calculate_hampel_method(lab_data, s_star)
+                robust_mean = calculator.calculate_hampel_method(data, s_star)
             
             # 显示结果对比
             st.subheader("结果对比")
@@ -495,7 +435,7 @@ def main():
             
             # 绘制图形
             st.subheader("可视化结果")
-            fig = calculator.plot_comparison(lab_data)
+            fig = calculator.plot_comparison(data)
             st.pyplot(fig)
             
             # 下载结果
@@ -503,8 +443,8 @@ def main():
             
             # 创建结果数据框
             results_df = pd.DataFrame({
-                "统计量": ["传统算术平均值", "传统标准差", "实验室间标准差", "Q方法稳健标准差", "Hampel稳健平均值"],
-                "数值": [trad_mean, trad_std, between_std, s_star, robust_mean]
+                "统计量": ["传统算术平均值", "传统标准差", "Q方法稳健标准差", "Hampel稳健平均值"],
+                "数值": [trad_mean, trad_std, s_star, robust_mean]
             })
             
             # 转换为CSV
@@ -520,9 +460,13 @@ def main():
     # 侧边栏 - 方法说明
     st.sidebar.header("方法说明")
     st.sidebar.markdown("""
+    **本版本特点**：
+    - 适用于多个实验室数据作为同一组输入的情况
+    - 直接对所有数据点进行计算，不分实验室
+    - 对异常值具有鲁棒性
+    
     **Q方法特点**：
     - 基于成对绝对差，不使用均值或中位数
-    - 对异常值具有鲁棒性
     - 直接估计重复性和再现性标准差
     
     **Hampel方法特点**：
