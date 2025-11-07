@@ -8,347 +8,535 @@ Created on Thu Nov  6 09:59:01 2025
 import streamlit as st
 import numpy as np
 import pandas as pd
+from scipy import stats
 import matplotlib.pyplot as plt
-import seaborn as sns
-from io import StringIO
-import base64
+import io
 
-# 设置页面配置
-st.set_page_config(
-    page_title="智能稳健标准差分析器",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# 应用标题和描述
-st.title("📊 智能稳健标准差分析器")
-st.markdown("""
-此应用使用Huber's M-estimator自动分析数据的稳健标准差特性，能够智能识别数据类型并选择最优参数。
-支持**高度集中数据**、**中等集中数据**和**正常分布数据**的自动识别与处理。
-""")
-
-# 侧边栏配置
-st.sidebar.header("配置参数")
-st.sidebar.markdown("调整Huber M-estimator的参数设置：")
-
-# Huber参数设置
-c_value = st.sidebar.slider(
-    "Huber参数 c", 
-    min_value=1.0, 
-    max_value=2.0, 
-    value=1.345, 
-    step=0.01,
-    help="较小的c值对异常值更敏感，较大的c值更接近传统标准差"
-)
-
-# 数据输入方式选择
-input_method = st.radio("选择数据输入方式:", 
-                       ["上传CSV文件", "直接输入数据", "使用示例数据"])
-
-class RobustStdAnalyzer:
-    """稳健标准差分析器"""
+class RobustQHampel:
+    """
+    Q/Hampel方法的Streamlit实现
+    """
     
     def __init__(self):
-        self.data_type = None
-        self.analysis_results = {}
+        self.s_star = None
+        self.robust_mean = None
+        self.lab_means = None
+        self.original_data = None
     
-    def analyze_data_characteristics(self, data):
-        """分析数据特征"""
-        n = len(data)
-        mean_val = np.mean(data)
-        median_val = np.median(data)
-        std_val = np.std(data)
-        mad_val = np.median(np.abs(data - median_val))
-        
-        # 数据分布特征
-        unique_vals, counts = np.unique(data, return_counts=True)
-        max_count = np.max(counts)
-        concentration_ratio = max_count / n
-        
-        # 异常值检测
-        Q1 = np.percentile(data, 25)
-        Q3 = np.percentile(data, 75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        outliers = data[(data < lower_bound) | (data > upper_bound)]
-        outlier_ratio = len(outliers) / n
-        
-        # 判断数据类型
-        if concentration_ratio > 0.8 and mad_val == 0:
-            data_type = "高度集中数据"
-        elif concentration_ratio > 0.6 and outlier_ratio < 0.1:
-            data_type = "中等集中数据"
-        else:
-            data_type = "正常分布数据"
+    def parse_input_data(self, input_text):
+        """
+        解析用户输入的文本数据
+        """
+        try:
+            labs = input_text.split(';')
+            lab_data = []
             
-        characteristics = {
-            'n': n, 'mean': mean_val, 'median': median_val, 'std': std_val,
-            'mad': mad_val, 'concentration_ratio': concentration_ratio,
-            'outlier_ratio': outlier_ratio, 'data_type': data_type,
-            'unique_values_count': len(unique_vals), 'IQR': IQR
-        }
-        
-        return characteristics
+            for i, lab in enumerate(labs):
+                measurements = [float(x.strip()) for x in lab.split(',') if x.strip()]
+                if len(measurements) < 1:
+                    st.warning(f"实验室 {i+1} 没有有效数据，已跳过")
+                    continue
+                lab_data.append(measurements)
+            
+            if len(lab_data) < 2:
+                st.error("至少需要2个实验室的数据")
+                return None
+            
+            return lab_data
+        except Exception as e:
+            st.error(f"数据解析错误: {e}")
+            return None
     
-    def huber_robust_std(self, data, c=1.345, tol=1e-6, max_iter=100):
-        """Huber M-estimator计算稳健标准差"""
-        n = len(data)
-        location = np.median(data)
+    def calculate_q_method(self, lab_data):
+        """
+        Q方法计算稳健标准差 - 使用修正后的公式
+        """
+        st.info("正在计算Q方法稳健标准差...")
         
-        # 初始尺度估计
-        mad = np.median(np.abs(data - location))
-        if mad == 0:
-            q90, q10 = np.percentile(data, [90, 10])
-            scale = (q90 - q10) / (2 * 1.645)
-            if scale == 0:
-                q75, q25 = np.percentile(data, [75, 25])
-                iqr = q75 - q25
-                scale = iqr / 1.349 if iqr > 0 else np.std(data) * 0.1
-        else:
-            scale = 1.4826 * mad
+        # 计算所有成对绝对差
+        all_data = []
+        for lab in lab_data:
+            all_data.extend(lab)
         
-        # 迭代计算
-        for i in range(max_iter):
-            residuals = data - location
-            standardized = residuals / scale
+        absolute_diffs = []
+        n = len(all_data)
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = abs(all_data[i] - all_data[j])
+                if diff > 1e-10:  # 避免浮点数误差
+                    absolute_diffs.append(diff)
+        
+        if not absolute_diffs:
+            st.error("错误：没有有效的成对差值")
+            return 0.0
+        
+        # 进度条
+        progress_bar = st.progress(0)
+        
+        # 排序并计算经验CDF
+        sorted_diffs = sorted(absolute_diffs)
+        unique_points = []
+        if sorted_diffs:
+            current_val = sorted_diffs[0]
+            unique_points.append(current_val)
             
-            psi_values = np.where(np.abs(standardized) <= c, 
-                                 standardized, 
-                                 c * np.sign(standardized))
-            
-            new_location = location + scale * np.mean(psi_values)
-            
-            chi_values = np.where(np.abs(standardized) <= c, 
-                                 standardized**2, 
-                                 c**2)
-            
-            new_scale = scale * np.sqrt(np.mean(chi_values) / 0.5)
-            
-            if (abs(new_location - location) < tol and 
-                abs(new_scale - scale) < tol):
-                break
+            for val in sorted_diffs[1:]:
+                if abs(val - current_val) > 1e-10:
+                    current_val = val
+                    unique_points.append(current_val)
+        
+        progress_bar.progress(30)
+        
+        # 计算H1(x)
+        H1_values = []
+        n_total = len(sorted_diffs)
+        for x in unique_points:
+            count = sum(1 for d in sorted_diffs if d <= x + 1e-10)
+            H1_values.append(count / n_total)
+        
+        progress_bar.progress(60)
+        
+        # 计算G1(x)
+        G1_values = [0.0]  # G1(0) = 0
+        x_with_zero = [0.0] + unique_points
+        
+        for i in range(len(unique_points)):
+            if i == 0:
+                if unique_points[i] > 1e-10:
+                    G1_val = 0.5 * H1_values[i]
+                else:
+                    G1_val = 0.0
+            else:
+                G1_val = 0.5 * (H1_values[i] + H1_values[i-1])
+            G1_values.append(G1_val)
+        
+        progress_bar.progress(80)
+        
+        # 计算稳健标准差 s* - 使用修正后的公式
+        H1_0 = 0.0  # 因为只考虑正差值
+        
+        # 计算参数
+        a = 0.25 + 0.75 * H1_0
+        b = 0.625 + 0.375 * H1_0
+        
+        # 线性插值求G1^{-1}(a)
+        G1_inv_a = self._inverse_interpolation(G1_values, x_with_zero, a)
+        
+        # 标准正态分布的分位数
+        phi_inv_b = stats.norm.ppf(b)
+        
+        # 使用修正后的公式计算s*
+        s_star = G1_inv_a / (np.sqrt(2) * phi_inv_b)
+        
+        progress_bar.progress(100)
+        
+        # 显示中间计算结果
+        with st.expander("查看Q方法计算详情"):
+            st.write(f"成对绝对差数量: {len(absolute_diffs)}")
+            st.write(f"计算参数: a = {a:.4f}, b = {b:.4f}")
+            st.write(f"G1_inv({a:.4f}) = {G1_inv_a:.6f}")
+            st.write(f"φ_inv({b:.4f}) = {phi_inv_b:.6f}")
+        
+        return s_star
+    
+    def _inverse_interpolation(self, G_values, x_points, target):
+        """线性插值求逆函数值"""
+        for i in range(len(G_values) - 1):
+            if (G_values[i] <= target <= G_values[i + 1]) or (G_values[i + 1] <= target <= G_values[i]):
+                x1 = x_points[i]
+                x2 = x_points[i + 1]
+                y1 = G_values[i]
+                y2 = G_values[i + 1]
                 
-            location, scale = new_location, new_scale
+                if abs(y2 - y1) < 1e-10:
+                    return x1
+                
+                return x1 + (target - y1) * (x2 - x1) / (y2 - y1)
         
-        return location, scale
+        # 边界情况
+        if target <= G_values[0]:
+            return x_points[0]
+        else:
+            return x_points[-1]
     
-    def comprehensive_analysis(self, data, c):
-        """综合分析"""
-        # 传统统计量
-        traditional_std = np.std(data)
-        mad_std = 1.4826 * np.median(np.abs(data - np.median(data)))
+    def calculate_hampel_method(self, lab_data, s_star):
+        """
+        Hampel方法计算稳健平均值
+        """
+        st.info("正在计算Hampel方法稳健平均值...")
         
-        # Huber稳健估计
-        huber_location, huber_std = self.huber_robust_std(data, c)
+        # 计算实验室均值
+        lab_means = [np.mean(lab) for lab in lab_data]
+        self.lab_means = lab_means
+        p = len(lab_means)
         
-        # 数据特征
-        characteristics = self.analyze_data_characteristics(data)
+        # 生成插值节点
+        nodes = []
+        for y in lab_means:
+            offsets = [-4.5, -3.0, -1.5, 1.5, 3.0, 4.5]
+            for offset in offsets:
+                nodes.append(y + offset * s_star)
         
-        results = {
-            'traditional_std': traditional_std,
-            'mad_std': mad_std if mad_std > 0 else 0,
-            'huber_std': huber_std,
-            'huber_location': huber_location,
-            'data_type': characteristics['data_type'],
-            'characteristics': characteristics
-        }
+        sorted_nodes = sorted(nodes)
+        median_val = np.median(lab_means)
         
-        self.analysis_results.update(results)
-        return results
+        # 寻找方程的解
+        solutions = []
+        for m in range(len(sorted_nodes) - 1):
+            d_m = sorted_nodes[m]
+            d_m1 = sorted_nodes[m + 1]
+            
+            P_m = sum(self._psi_function((y - d_m) / s_star) for y in lab_means)
+            P_m1 = sum(self._psi_function((y - d_m1) / s_star) for y in lab_means)
+            
+            if abs(P_m) < 1e-10:
+                solutions.append(d_m)
+            elif abs(P_m1) < 1e-10:
+                solutions.append(d_m1)
+            elif P_m * P_m1 < 0:
+                # 线性插值
+                x_star = d_m - P_m * (d_m1 - d_m) / (P_m1 - P_m)
+                solutions.append(x_star)
+        
+        # 选择最接近中位数的解
+        if not solutions:
+            robust_mean = median_val
+            st.warning("未找到解，使用中位数作为稳健平均值")
+        else:
+            distances = [abs(sol - median_val) for sol in solutions]
+            min_dist = min(distances)
+            closest_solutions = [sol for sol, dist in zip(solutions, distances) 
+                               if abs(dist - min_dist) < 1e-10]
+            
+            if len(closest_solutions) == 1:
+                robust_mean = closest_solutions[0]
+            else:
+                robust_mean = median_val
+                st.warning("多个解同样接近中位数，使用中位数作为稳健平均值")
+        
+        return robust_mean
+    
+    def _psi_function(self, q):
+        """Hampel ψ函数"""
+        if -1.5 <= q <= 1.5:
+            return q
+        elif 1.5 < q <= 3.0:
+            return 1.5
+        elif 3.0 < q <= 4.5:
+            return 1.5 * (4.5 - q) / 1.5
+        elif q > 4.5:
+            return 0.0
+        elif -3.0 <= q < -1.5:
+            return -1.5
+        elif -4.5 <= q < -3.0:
+            return -1.5 * (-4.5 - q) / 1.5
+        else:
+            return 0.0
+    
+    def calculate_traditional_stats(self, lab_data):
+        """计算传统统计量用于对比"""
+        all_data = []
+        for lab in lab_data:
+            all_data.extend(lab)
+        
+        traditional_mean = np.mean(all_data)
+        traditional_std = np.std(all_data, ddof=1)  # 样本标准差
+        
+        lab_means = [np.mean(lab) for lab in lab_data]
+        between_lab_std = np.std(lab_means, ddof=1) if len(lab_means) > 1 else 0
+        
+        return traditional_mean, traditional_std, between_lab_std
+    
+    def plot_comparison(self, lab_data):
+        """绘制结果对比图"""
+        if lab_data is None or self.lab_means is None:
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # 图1: 各实验室数据分布
+        all_data = []
+        for i, lab in enumerate(lab_data):
+            all_data.extend(lab)
+            ax1.scatter([i+1] * len(lab), lab, alpha=0.6, label=f'Lab {i+1}')
+        
+        traditional_mean = np.mean(all_data)
+        ax1.axhline(y=traditional_mean, color='r', linestyle='--', 
+                   label=f'传统均值: {traditional_mean:.3f}')
+        
+        if self.robust_mean is not None:
+            ax1.axhline(y=self.robust_mean, color='g', linestyle='-', 
+                       label=f'稳健均值: {self.robust_mean:.3f}')
+        
+        ax1.set_xlabel('实验室编号')
+        ax1.set_ylabel('测量值')
+        ax1.set_title('各实验室数据分布')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 图2: 实验室均值比较
+        lab_indices = range(1, len(self.lab_means) + 1)
+        ax2.bar(lab_indices, self.lab_means, alpha=0.7, color='skyblue')
+        ax2.axhline(y=traditional_mean, color='r', linestyle='--', 
+                   label=f'传统均值: {traditional_mean:.3f}')
+        
+        if self.robust_mean is not None:
+            ax2.axhline(y=self.robust_mean, color='g', linestyle='-', 
+                       label=f'稳健均值: {self.robust_mean:.3f}')
+        
+        ax2.set_xlabel('实验室编号')
+        ax2.set_ylabel('实验室均值')
+        ax2.set_title('实验室均值比较')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        return fig
 
-def plot_data_distribution(data, huber_location, data_type):
-    """绘制数据分布图"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-    
-    # 直方图
-    ax1.hist(data, bins=30, alpha=0.7, color='skyblue', edgecolor='black')
-    ax1.axvline(huber_location, color='red', linestyle='--', 
-                label=f'Huber位置: {huber_location:.3f}')
-    ax1.set_xlabel('数值')
-    ax1.set_ylabel('频数')
-    ax1.set_title(f'数据分布 - {data_type}')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # 箱线图
-    ax2.boxplot(data, vert=True)
-    ax2.set_ylabel('数值')
-    ax2.set_title('数据箱线图')
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    return fig
-
-def get_sample_data(choice):
-    """获取示例数据"""
-    if choice == "数据一（高度集中）":
-        return np.array([
-            -21, -20, -20, -20, -20, -20, -20, -20, -20, -20, -20, -20, -20, -20, -20,
-            -20, -20, -20, -20, -20, -20, -20, -20, -20, -20, -20, -20, -20, -19, -19,
-            -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19,
-            -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19, -19,
-            -19, -19, -19, -19, -19, -19, -18
-        ])
-    else:  # 数据二（中等集中）
-        return np.array([
-            827.6, 827.6, 827.6, 827.7, 827.7, 827.7, 827.6, 827.6, 827.6, 827.6,
-            827.6, 827.7, 827.6, 827.6, 827.7, 827.6, 827.6, 827.7, 827.7, 827.7,
-            827.7, 827.7, 827.6, 827.6, 827.6, 827.6, 827.7, 827.7, 827.7, 827.7,
-            827.6, 827.5, 827.5, 827.5, 827.8, 827.6, 827.8, 827.9, 827.4, 827.4,
-            827.8, 827.4, 827.7, 827.5, 827.5, 827.6, 827.4, 828.1, 827.4, 827.5,
-            827.6, 827.7, 827.6, 827.4, 827.6, 827.4, 827.2, 827.4, 826.1, 826.8,
-            827.5, 827.4, 827.6, 827.1, 827.4, 827.7
-        ])
-
-# 主应用逻辑
 def main():
-    analyzer = RobustStdAnalyzer()
-    data = None
+    st.set_page_config(
+        page_title="Q/Hampel稳健统计方法",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
     
-    # 数据输入部分
-    if input_method == "上传CSV文件":
-        uploaded_file = st.file_uploader("上传CSV文件", type=['csv'])
+    st.title("📊 Q/Hampel稳健统计方法计算器")
+    st.markdown("""
+    本应用实现Q方法和Hampel方法，用于计算稳健的标准差和平均值，对异常值具有鲁棒性。
+    
+    **Q方法**：基于实验室结果数据集的成对绝对差，直接估计重复性标准差和再现性标准差。
+    
+    **Hampel方法**：采用迭代加权法估计稳健平均值，通过回归残差大小确定各样本权重。
+    """)
+    
+    # 初始化计算器
+    calculator = RobustQHampel()
+    
+    # 侧边栏 - 数据输入选项
+    st.sidebar.header("数据输入选项")
+    
+    input_method = st.sidebar.radio(
+        "选择数据输入方式:",
+        ["手动输入", "使用演示数据", "上传CSV文件"]
+    )
+    
+    lab_data = None
+    
+    if input_method == "手动输入":
+        st.header("手动输入数据")
+        st.markdown("""
+        输入格式要求：
+        - 每个实验室的数据用**逗号**分隔
+        - 不同实验室用**分号**分隔
+        - 示例：`10.1,10.2,10.3;10.5,10.6,10.4;9.8,9.9,9.7`
+        """)
+        
+        input_text = st.text_area(
+            "输入实验室数据:",
+            value="10.1,10.2,10.3;10.5,10.6,10.4;9.8,9.9,9.7;10.7,10.8,10.6;9.5,9.6,9.4",
+            height=100
+        )
+        
+        if st.button("解析数据"):
+            lab_data = calculator.parse_input_data(input_text)
+            if lab_data:
+                st.success(f"成功解析 {len(lab_data)} 个实验室的数据")
+                
+                # 显示数据表格
+                data_display = []
+                for i, lab in enumerate(lab_data):
+                    for j, value in enumerate(lab):
+                        data_display.append({
+                            "实验室": f"Lab {i+1}",
+                            "测量序号": j+1,
+                            "测量值": value
+                        })
+                
+                df = pd.DataFrame(data_display)
+                st.dataframe(df, use_container_width=True)
+                
+                # 显示汇总统计
+                st.subheader("数据汇总")
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    total_measurements = sum(len(lab) for lab in lab_data)
+                    st.metric("实验室数量", len(lab_data))
+                
+                with col2:
+                    st.metric("总测量次数", total_measurements)
+                
+                with col3:
+                    avg_measurements = total_measurements / len(lab_data)
+                    st.metric("平均每实验室测量次数", f"{avg_measurements:.1f}")
+    
+    elif input_method == "使用演示数据":
+        st.header("演示数据")
+        demo_data = [
+            [10.1, 10.2, 10.3, 10.15],
+            [10.5, 10.6, 10.4, 10.55],
+            [9.8, 9.9, 9.7, 9.85],
+            [10.7, 10.8, 10.6, 10.65],
+            [9.5, 9.6, 9.4, 9.45],
+            [10.3, 10.2, 10.4, 10.25]
+        ]
+        
+        lab_data = demo_data
+        
+        # 显示演示数据
+        st.info("使用预定义的演示数据")
+        data_display = []
+        for i, lab in enumerate(demo_data):
+            for j, value in enumerate(lab):
+                data_display.append({
+                    "实验室": f"Lab {i+1}",
+                    "测量序号": j+1,
+                    "测量值": value
+                })
+        
+        df = pd.DataFrame(data_display)
+        st.dataframe(df, use_container_width=True)
+    
+    elif input_method == "上传CSV文件":
+        st.header("上传CSV文件")
+        st.markdown("""
+        上传CSV文件格式要求：
+        - 每行代表一个实验室的数据
+        - 每列代表一次重复测量
+        - 文件应包含数值数据，表头可选
+        """)
+        
+        uploaded_file = st.file_uploader("选择CSV文件", type=['csv'])
+        
         if uploaded_file is not None:
             try:
                 df = pd.read_csv(uploaded_file)
-                st.write("数据预览:", df.head())
-                # 假设数据在第一列
-                if len(df.columns) > 0:
-                    data = df.iloc[:, 0].values
-                    st.success(f"成功加载 {len(data)} 个数据点")
+                st.success("文件上传成功！")
+                
+                # 显示数据预览
+                st.subheader("数据预览")
+                st.dataframe(df, use_container_width=True)
+                
+                # 转换为lab_data格式
+                lab_data = []
+                for i, row in df.iterrows():
+                    lab_measurements = [val for val in row if not pd.isna(val)]
+                    if len(lab_measurements) > 0:
+                        lab_data.append(lab_measurements)
+                
+                if len(lab_data) < 2:
+                    st.error("至少需要2个实验室的数据")
+                    lab_data = None
+                else:
+                    st.success(f"成功解析 {len(lab_data)} 个实验室的数据")
+            
             except Exception as e:
                 st.error(f"文件读取错误: {e}")
     
-    elif input_method == "直接输入数据":
-        data_input = st.text_area("输入数据（用逗号分隔）:", 
-                                value="-21, -20, -20, -20, -19, -19, -18")
-        if st.button("解析数据"):
-            try:
-                data_list = [float(x.strip()) for x in data_input.split(',')]
-                data = np.array(data_list)
-                st.success(f"成功解析 {len(data)} 个数据点")
-            except Exception as e:
-                st.error(f"数据解析错误: {e}")
-    
-    else:  # 使用示例数据
-        sample_choice = st.selectbox("选择示例数据集:", 
-                                   ["数据一（高度集中）", "数据二（中等集中）"])
-        data = get_sample_data(sample_choice)
-        st.success(f"已加载示例数据: {sample_choice} ({len(data)} 个数据点)")
-    
-    # 数据分析部分
-    if data is not None:
-        st.markdown("---")
+    # 计算按钮和结果显示
+    if lab_data is not None:
+        st.header("计算结果")
         
-        # 执行分析
-        with st.spinner("正在分析数据..."):
-            results = analyzer.comprehensive_analysis(data, c_value)
-            characteristics = results['characteristics']
-        
-        # 显示分析结果
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("数据类型", characteristics['data_type'])
-            st.metric("数据量", characteristics['n'])
-            st.metric("唯一值数量", characteristics['unique_values_count'])
-        
-        with col2:
-            st.metric("均值", f"{characteristics['mean']:.4f}")
-            st.metric("中位数", f"{characteristics['median']:.4f}")
-            st.metric("集中度比例", f"{characteristics['concentration_ratio']:.3f}")
-        
-        with col3:
-            st.metric("传统标准差", f"{results['traditional_std']:.4f}")
-            st.metric("MAD标准差", f"{results['mad_std']:.4f}")
-            st.metric("Huber稳健标准差", f"{results['huber_std']:.4f}")
-        
-        # 可视化
-        st.markdown("### 📈 数据可视化")
-        fig = plot_data_distribution(data, results['huber_location'], 
-                                   characteristics['data_type'])
-        st.pyplot(fig)
-        
-        # 详细统计信息
-        st.markdown("### 📋 详细统计信息")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.write("**数据分布统计:**")
-            unique_vals, counts = np.unique(data, return_counts=True)
-            dist_df = pd.DataFrame({
-                '数值': unique_vals,
-                '频数': counts,
-                '比例 (%)': (counts / len(data) * 100).round(2)
+        if st.button("开始计算", type="primary"):
+            # 创建计算进度区域
+            with st.spinner("正在进行稳健统计计算..."):
+                # 计算传统统计量
+                trad_mean, trad_std, between_std = calculator.calculate_traditional_stats(lab_data)
+                
+                # 计算Q方法
+                s_star = calculator.calculate_q_method(lab_data)
+                
+                # 计算Hampel方法
+                robust_mean = calculator.calculate_hampel_method(lab_data, s_star)
+            
+            # 显示结果对比
+            st.subheader("结果对比")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric(
+                    "传统算术平均值", 
+                    f"{trad_mean:.6f}",
+                    delta=f"{(robust_mean - trad_mean):.6f}"
+                )
+            
+            with col2:
+                st.metric(
+                    "传统标准差", 
+                    f"{trad_std:.6f}",
+                    delta=f"{(s_star - trad_std):.6f}"
+                )
+            
+            with col3:
+                st.metric("Q方法稳健标准差", f"{s_star:.6f}")
+            
+            with col4:
+                st.metric("Hampel稳健平均值", f"{robust_mean:.6f}")
+            
+            # 相对差异
+            st.subheader("相对差异分析")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if abs(trad_mean) > 1e-10:
+                    mean_diff_pct = abs(robust_mean - trad_mean) / abs(trad_mean) * 100
+                    st.metric("均值相对差异", f"{mean_diff_pct:.2f}%")
+                else:
+                    st.metric("均值相对差异", "N/A")
+            
+            with col2:
+                if abs(trad_std) > 1e-10:
+                    std_diff_pct = abs(s_star - trad_std) / trad_std * 100
+                    st.metric("标准差相对差异", f"{std_diff_pct:.2f}%")
+                else:
+                    st.metric("标准差相对差异", "N/A")
+            
+            # 绘制图形
+            st.subheader("可视化结果")
+            fig = calculator.plot_comparison(lab_data)
+            st.pyplot(fig)
+            
+            # 下载结果
+            st.subheader("下载结果")
+            
+            # 创建结果数据框
+            results_df = pd.DataFrame({
+                "统计量": ["传统算术平均值", "传统标准差", "实验室间标准差", "Q方法稳健标准差", "Hampel稳健平均值"],
+                "数值": [trad_mean, trad_std, between_std, s_star, robust_mean]
             })
-            st.dataframe(dist_df, use_container_width=True)
-        
-        with col2:
-            st.write("**分位数统计:**")
-            quantiles = {
-                '最小值': np.min(data),
-                'Q1 (25%)': np.percentile(data, 25),
-                '中位数 (50%)': np.percentile(data, 50),
-                'Q3 (75%)': np.percentile(data, 75),
-                '最大值': np.max(data),
-                'IQR': characteristics['IQR']
-            }
-            quantile_df = pd.DataFrame(list(quantiles.items()), 
-                                     columns=['统计量', '值'])
-            st.dataframe(quantile_df, use_container_width=True)
-        
-        # 方法比较
-        st.markdown("### ⚖️ 方法比较")
-        methods_data = {
-            '方法': ['传统标准差', 'MAD标准差', 'Huber稳健标准差'],
-            '标准差估计': [
-                results['traditional_std'],
-                results['mad_std'],
-                results['huber_std']
-            ],
-            '适用场景': [
-                '无异常值的数据',
-                '有异常值但高度集中',
-                '各种数据类型（推荐）'
-            ]
-        }
-        methods_df = pd.DataFrame(methods_data)
-        st.dataframe(methods_df, use_container_width=True)
-        
-        # 解释说明
-        st.markdown("### 💡 分析说明")
-        st.info(f"""
-        **数据类型识别**: {characteristics['data_type']}
-        
-        - **传统标准差**: {results['traditional_std']:.4f} - 对异常值敏感
-        - **MAD标准差**: {results['mad_std']:.4f} - 对异常值稳健，但可能为0
-        - **Huber稳健标准差**: {results['huber_std']:.4f} - 平衡稳健性和效率
-        
-        **推荐**: 对于{characteristics['data_type']}，建议使用Huber稳健标准差作为变异性度量。
-        """)
-        
-        # 下载结果
-        st.markdown("### 📥 下载分析结果")
-        results_df = pd.DataFrame({
-            '统计量': [
-                '数据量', '均值', '中位数', '传统标准差', 'MAD标准差', 
-                'Huber稳健标准差', '数据类型', '集中度比例'
-            ],
-            '值': [
-                characteristics['n'], characteristics['mean'], 
-                characteristics['median'], results['traditional_std'],
-                results['mad_std'], results['huber_std'],
-                characteristics['data_type'], characteristics['concentration_ratio']
-            ]
-        })
-        
-        csv = results_df.to_csv(index=False)
-        b64 = base64.b64encode(csv.encode()).decode()
-        href = f'<a href="data:file/csv;base64,{b64}" download="robust_std_analysis.csv">下载CSV分析报告</a>'
-        st.markdown(href, unsafe_allow_html=True)
+            
+            # 转换为CSV
+            csv = results_df.to_csv(index=False)
+            
+            st.download_button(
+                label="下载结果为CSV",
+                data=csv,
+                file_name="q_hampel_results.csv",
+                mime="text/csv"
+            )
+    
+    # 侧边栏 - 方法说明
+    st.sidebar.header("方法说明")
+    st.sidebar.markdown("""
+    **Q方法特点**：
+    - 基于成对绝对差，不使用均值或中位数
+    - 对异常值具有鲁棒性
+    - 直接估计重复性和再现性标准差
+    
+    **Hampel方法特点**：
+    - 采用迭代加权法
+    - 残差大的点权重低，残差小的点权重高
+    - 通过ψ函数实现稳健估计
+    """)
+    
+    st.sidebar.header("参考文献")
+    st.sidebar.markdown("""
+    [1] ISO 5725-5: Accuracy of measurement methods and results
+    
+    [9] Rousseeuw, P.J., & Leroy, A.M. (1987). Robust Regression and Outlier Detection
+    """)
 
-# 运行应用
 if __name__ == "__main__":
-    main()  
+    main()
