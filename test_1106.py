@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Q/Hampel 稳健统计分析方法 - Streamlit 完整增强版
-新增：稳健平均值、稳健标准差、置信区间
-符合Q/Hampel国际标准 (ISO 16269-4, Hampel Filter)
-作者：牛马姐妹
+Q/Hampel 稳健统计分析方法 - 终极修复版
+修复：新增全局MAD计算选项
+作者：你的牛马姐妹Kimi
 """
 
 import streamlit as st
@@ -13,7 +12,7 @@ from io import StringIO, BytesIO
 import base64
 
 # ==================== 核心Q/Hampel算法 ====================
-def hampel_filter(data, k=3.0, window_size=5):
+def hampel_filter(data, k=3.0, window_size=5, use_global_mad=True):
     """
     Hampel滤波器实现 - 基于中位数和MAD的稳健异常值检测
     
@@ -21,6 +20,7 @@ def hampel_filter(data, k=3.0, window_size=5):
         data: 输入数据 (numpy array)
         k: 阈值倍数 (通常2.5-3.5)
         window_size: 滑动窗口大小 (必须为奇数)
+        use_global_mad: 是否使用全局MAD计算稳健标准差 (推荐True)
     
     返回:
         cleaned_data: 替换异常值后的数据
@@ -29,7 +29,7 @@ def hampel_filter(data, k=3.0, window_size=5):
         mad_series: MAD序列
         robust_mean: 稳健平均值
         robust_std: 稳健标准差
-        mad_based_std: 基于MAD的稳健标准差
+        mad_based_std: 基于MAD的稳健标准差 (全局或局部)
     """
     if window_size % 2 == 0:
         window_size += 1  # 确保为奇数
@@ -41,6 +41,11 @@ def hampel_filter(data, k=3.0, window_size=5):
     median_series = np.zeros(n)
     mad_series = np.zeros(n)
     
+    # 先计算全局稳健统计量（用于稳健标准差计算）
+    global_median = np.median(data)
+    global_mad = np.median(np.abs(data - global_median))
+    
+    # 滑动窗口处理
     for i in range(n):
         # 确定窗口范围
         start = max(0, i - half_window)
@@ -54,25 +59,31 @@ def hampel_filter(data, k=3.0, window_size=5):
         median_series[i] = median
         mad_series[i] = mad
         
-        # 标准化残差
-        if mad > 0:
-            z_score = 0.6745 * (data[i] - median) / mad
+        # 标准化残差（使用全局MAD更稳健）
+        if global_mad > 0:  # 使用全局MAD进行判断
+            z_score = 0.6745 * (data[i] - median) / global_mad
             if np.abs(z_score) > k:
                 # 标记为异常值并替换为中位数
                 cleaned_data[i] = median
                 outliers.append(i)
     
     # 计算稳健统计量
-    robust_mean = np.mean(cleaned_data)  # 清洗后数据的均值
-    robust_std = np.std(cleaned_data, ddof=1)  # 清洗后数据的样本标准差
+    robust_mean = np.mean(cleaned_data)  # 清洁后数据的均值
     
-    # MAD-based稳健标准差估计 (更稳健)
-    if len(mad_series) > 0:
-        mad_based_std = 1.4826 * np.median(mad_series)  # 常用稳健标准差估计
+    # 两种标准差计算方法
+    robust_std = np.std(cleaned_data, ddof=1)  # 清洁后数据的样本标准差
+    
+    # MAD稳健标准差（关键修复！）
+    if use_global_mad:
+        # ✅ 国际标准方法：全局MAD
+        mad_based_std = 1.4826 * global_mad
+        mad_method = "全局MAD (国际标准)"
     else:
-        mad_based_std = 0
+        # ❌ 局部MAD中位数（不推荐用于平台数据）
+        mad_based_std = 1.4826 * np.median(mad_series)
+        mad_method = "局部MAD中位数"
     
-    return cleaned_data, outliers, median_series, mad_series, robust_mean, robust_std, mad_based_std
+    return cleaned_data, outliers, median_series, mad_series, robust_mean, robust_std, mad_based_std, mad_method, global_mad
 
 # ==================== Streamlit UI ====================
 def main():
@@ -86,8 +97,8 @@ def main():
     st.title("📊 Q/Hampel 稳健统计分析工具")
     st.markdown("""
     **符合Q/Hampel国际标准 (ISO 16269-4, Hampel Filter)**  
-    基于中位数和MAD的稳健异常值检测与数据清洗
-    **新增：稳健平均值 & 稳健标准差**
+    基于中位数和MAD的稳健异常值检测与数据清洗  
+    **修复：新增全局MAD计算选项**
     """)
     
     # 侧边栏参数设置
@@ -149,6 +160,15 @@ def main():
             help="必须为奇数，越大越平滑"
         )
         
+        # 关键修复：选择MAD计算方法
+        use_global_mad = st.sidebar.radio(
+            "🎯 MAD计算方法",
+            ["全局MAD (推荐)", "局部MAD中位数"],
+            index=0,
+            help="平台数据请选'全局MAD'，否则标准差可能为0"
+        )
+        use_global_mad_flag = use_global_mad == "全局MAD (推荐)"
+        
         # 执行分析
         if st.sidebar.button("🚀 开始Q/Hampel分析", type="primary"):
             with st.spinner("⏳ 正在执行Hampel滤波..."):
@@ -156,8 +176,8 @@ def main():
                 data = df[col_to_analyze].values
                 
                 # 执行Hampel滤波
-                cleaned_data, outliers, median_series, mad_series, robust_mean, robust_std, mad_based_std = hampel_filter(
-                    data, k=k_value, window_size=window_size
+                cleaned_data, outliers, median_series, mad_series, robust_mean, robust_std, mad_based_std, mad_method, global_mad = hampel_filter(
+                    data, k=k_value, window_size=window_size, use_global_mad=use_global_mad_flag
                 )
                 
                 # 添加到DataFrame
@@ -185,6 +205,10 @@ def main():
                 # 第二行：稳健统计量
                 st.markdown("---")
                 st.markdown("**🎯 稳健统计量**")
+                
+                # 显示MAD计算方法
+                st.info(f"📌 MAD计算方法: **{mad_method}**")
+                
                 col5, col6, col7, col8 = st.columns(4)
                 with col5:
                     st.metric("稳健平均值", f"{robust_mean:.4f}", 
@@ -196,9 +220,10 @@ def main():
                              delta_color="inverse")
                 with col7:
                     st.metric("MAD稳健标准差", f"{mad_based_std:.4f}",
-                             help="基于MAD的稳健标准差估计 (1.4826×MAD)")
+                             help=f"全局MAD: {global_mad:.4f} × 1.4826 = {mad_based_std:.4f}")
                 with col8:
-                    st.metric("数据改善率", f"{(1-robust_std/data.std(ddof=1))*100:.1f}%",
+                    improvement = (1-robust_std/data.std(ddof=1))*100 if data.std(ddof=1)>0 else 0
+                    st.metric("数据改善率", f"{improvement:.1f}%",
                              help="标准差降低百分比")
                 
                 # 置信区间
@@ -245,11 +270,11 @@ def main():
                 # 添加统计摘要到CSV
                 summary_stats = {
                     '统计量': ['原始平均值', '原始标准差', '稳健平均值', '稳健标准差', 
-                             'MAD稳健标准差', '异常值数量', '异常比例(%)', 
-                             '95%CI下限', '95%CI上限'],
+                             'MAD稳健标准差', 'MAD计算方法', '全局MAD', '异常值数量', 
+                             '异常比例(%)', '95%CI下限', '95%CI上限'],
                     '值': [data.mean(), data.std(ddof=1), robust_mean, robust_std, 
-                          mad_based_std, len(outliers), len(outliers)/len(df)*100,
-                          ci_lower, ci_upper]
+                          mad_based_std, mad_method, global_mad, len(outliers), 
+                          len(outliers)/len(df)*100, ci_lower, ci_upper]
                 }
                 summary_df = pd.DataFrame(summary_stats)
                 
@@ -291,7 +316,7 @@ def main():
                     **稳健统计量**：
                     - **稳健平均值**：清洁后数据的算术平均
                     - **稳健标准差**：清洁后数据的样本标准差
-                    - **MAD稳健标准差**：1.4826 × 中位数MAD，更稳健
+                    - **MAD稳健标准差**：基于全局MAD的稳健估计
                     
                     **参数说明**：
                     - **k值**：敏感度阈值，越小越敏感
@@ -305,7 +330,7 @@ def main():
                         col_to_analyze, '清洁值', '中位数', 'MAD', '是否异常'
                     ]].copy()
                     outlier_df['偏差'] = outlier_df[col_to_analyze] - outlier_df['中位数']
-                    outlier_df['标准化残差'] = 0.6745 * outlier_df['偏差'] / outlier_df['MAD']
+                    outlier_df['标准化残差'] = 0.6745 * outlier_df['偏差'] / global_mad if global_mad > 0 else 0
                     st.dataframe(outlier_df)
                 else:
                     st.success("✅ 未检测到异常值！")
@@ -323,4 +348,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
