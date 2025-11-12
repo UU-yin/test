@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Q/Hampel 稳健统计分析方法 - 终极三合一版
-新增：3种稳健标准差计算方法
+Q/Hampel 稳健统计分析方法 - Bug修复版
+修复：numpy数组空值判断
 作者：牛马姐妹
 """
 
@@ -22,13 +22,13 @@ def hampel_filter(data, k=3.0, window_size=5):
     
     返回:
         cleaned_data: 替换异常值后的数据
-        outliers: 异常值索引列表
+        outliers: 异常值索引数组
         median_series: 中位数序列
         mad_series: MAD序列
         robust_mean: 稳健平均值
-        robust_std_clean: 清洁后数据标准差 (推荐)
-        robust_std_mad: MAD稳健标准差 (可能为0)
-        robust_std_iqr: IQR稳健标准差 (备选)
+        robust_std_clean: 清洁后数据标准差
+        robust_std_mad: MAD稳健标准差
+        robust_std_iqr: IQR稳健标准差
         global_mad: 全局MAD值
         global_median: 全局中位数
     """
@@ -38,7 +38,7 @@ def hampel_filter(data, k=3.0, window_size=5):
     half_window = window_size // 2
     n = len(data)
     cleaned_data = data.copy()
-    outliers = []
+    outliers = np.array([])  # 初始化为空数组
     median_series = np.zeros(n)
     mad_series = np.zeros(n)
     
@@ -65,33 +65,27 @@ def hampel_filter(data, k=3.0, window_size=5):
         median_series[i] = median
         mad_series[i] = mad
     
-    # 第二步：使用全局MAD判断异常值（避免局部MAD=0的问题）
+    # 第二步：使用全局MAD判断异常值
     residuals = data - median_series
-    z_scores = 0.6745 * residuals / global_mad if global_mad > 0 else np.zeros_like(residuals)
-    outliers = np.where(np.abs(z_scores) > k)[0]
-    
-    # 替换异常值
-    if len(outliers) > 0:
-        cleaned_data[outliers] = median_series[outliers]
+    if global_mad > 0:
+        z_scores = 0.6745 * residuals / global_mad
+        outliers = np.where(np.abs(z_scores) > k)[0]
+        
+        # 替换异常值
+        if len(outliers) > 0:  # 使用len()判断
+            cleaned_data[outliers] = median_series[outliers]
     
     # 计算三种稳健标准差
     robust_mean = np.mean(cleaned_data)
+    robust_std_clean = np.std(cleaned_data, ddof=1)  # 清洁后数据的标准差
     
-    # 方法1：清洁后数据的标准差（最可靠）
-    robust_std_clean = np.std(cleaned_data, ddof=1)
+    # MAD稳健标准差
+    robust_std_mad = 1.4826 * global_mad if global_mad > 0 else 0
     
-    # 方法2：MAD稳健标准差（可能为0）
-    if global_mad > 0:
-        robust_std_mad = 1.4826 * global_mad
-        mad_warning = ""
-    else:
-        robust_std_mad = 0
-        mad_warning = "⚠️ 全局MAD=0，数据重复性过高！"
+    # IQR稳健标准差
+    robust_std_iqr = iqr / 1.349
     
-    # 方法3：IQR稳健标准差（备选方案）
-    robust_std_iqr = iqr / 1.349  # IQR与正态分布标准差的关系
-    
-    return cleaned_data, outliers, median_series, mad_series, robust_mean, robust_std_clean, robust_std_mad, robust_std_iqr, global_mad, global_median, mad_warning
+    return cleaned_data, outliers, median_series, mad_series, robust_mean, robust_std_clean, robust_std_mad, robust_std_iqr, global_mad, global_median
 
 # ==================== Streamlit UI ====================
 def main():
@@ -105,8 +99,7 @@ def main():
     st.title("📊 Q/Hampel 稳健统计分析工具")
     st.markdown("""
     **符合Q/Hampel国际标准 (ISO 16269-4, Hampel Filter)**  
-    基于中位数和MAD的稳健异常值检测与数据清洗  
-    **🎯 新增：3种稳健标准差计算方法**
+    基于中位数和MAD的稳健异常值检测与数据清洗
     """)
     
     # 侧边栏参数设置
@@ -177,7 +170,7 @@ def main():
                 # 执行Hampel滤波
                 (cleaned_data, outliers, median_series, mad_series, robust_mean, 
                  robust_std_clean, robust_std_mad, robust_std_iqr, 
-                 global_mad, global_median, mad_warning) = hampel_filter(
+                 global_mad, global_median) = hampel_filter(
                     data, k=k_value, window_size=window_size
                 )
                 
@@ -191,10 +184,6 @@ def main():
                 
                 # ==================== 结果展示 ====================
                 st.subheader("📊 分析结果")
-                
-                # 显示MAD警告（如果存在）
-                if mad_warning:
-                    st.warning(mad_warning)
                 
                 # 统计信息 - 第一行：基础统计
                 col1, col2, col3, col4 = st.columns(4)
@@ -216,29 +205,20 @@ def main():
                     st.metric("稳健平均值", f"{robust_mean:.4f}", 
                              delta=f"{robust_mean-data.mean():.4f}", 
                              delta_color="inverse")
-                    st.caption("清洁后数据的算术平均")
-                
                 with col6:
-                    # 显示最可靠的稳健标准差
-                    st.metric("稳健标准差(清洁数据)", f"{robust_std_clean:.4f}",
+                    st.metric("稳健标准差", f"{robust_std_clean:.4f}",
                              delta=f"{robust_std_clean-data.std(ddof=1):.4f}",
                              delta_color="inverse")
-                    st.caption("推荐使用方法")
                 
-                # 第三行：两种备选稳健标准差
+                # 第三行：备选稳健标准差
                 st.markdown("---")
                 st.markdown("**📏 备选稳健标准差**")
                 
                 col7, col8 = st.columns(2)
                 with col7:
-                    st.metric("MAD稳健标准差", f"{robust_std_mad:.4f}",
-                             help=f"全局MAD方法: {global_mad:.4f} × 1.4826")
-                    if global_mad == 0:
-                        st.error("⚠️ 数据重复性过高，MAD=0！请参考其他方法")
-                
+                    st.metric("MAD稳健标准差", f"{robust_std_mad:.4f}")
                 with col8:
-                    st.metric("IQR稳健标准差", f"{robust_std_iqr:.4f}",
-                             help="四分位距方法，适合任何数据")
+                    st.metric("IQR稳健标准差", f"{robust_std_iqr:.4f}")
                 
                 # 置信区间
                 st.markdown("---")
@@ -261,7 +241,7 @@ def main():
                 st.line_chart(chart_data.set_index('索引'))
                 
                 # 异常值散点图
-                if outliers:
+                if len(outliers) > 0:  # ✅ 修复：使用len()判断
                     outlier_df = pd.DataFrame({
                         '索引': outliers,
                         '异常值': data[outliers]
@@ -283,14 +263,12 @@ def main():
                 
                 # 添加统计摘要到CSV
                 summary_stats = {
-                    '统计量': ['原始平均值', '原始标准差', '稳健平均值', 
-                             '稳健标准差(清洁数据)', 'MAD稳健标准差', 'IQR稳健标准差',
-                             '全局MAD', '异常值数量', '异常比例(%)', 
-                             '95%CI下限', '95%CI上限'],
-                    '值': [data.mean(), data.std(ddof=1), robust_mean, 
-                          robust_std_clean, robust_std_mad, robust_std_iqr,
-                          global_mad, len(outliers), len(outliers)/len(df)*100,
-                          ci_lower, ci_upper]
+                    '统计量': ['原始平均值', '原始标准差', '稳健平均值', '稳健标准差',
+                             'MAD稳健标准差', 'IQR稳健标准差', '全局MAD', '异常值数量',
+                             '异常比例(%)', '95%CI下限', '95%CI上限'],
+                    '值': [data.mean(), data.std(ddof=1), robust_mean, robust_std_clean,
+                          robust_std_mad, robust_std_iqr, global_mad, len(outliers),
+                          len(outliers)/len(df)*100, ci_lower, ci_upper]
                 }
                 summary_df = pd.DataFrame(summary_stats)
                 
@@ -307,8 +285,7 @@ def main():
                     label="下载完整分析报告(CSV)",
                     data=csv,
                     file_name="hampel_robust_analysis_result.csv",
-                    mime="text/csv",
-                    help="包含三种稳健统计量和详细数据"
+                    mime="text/csv"
                 )
                 
                 # 技术说明
@@ -316,32 +293,11 @@ def main():
                     st.markdown("""
                     ### 📖 Q/Hampel方法原理
                     
-                    **Hampel滤波器**是一种基于中位数和MAD（中位数绝对偏差）的稳健统计方法：
-                    
-                    1. **滑动窗口**：对每个数据点，取其邻域窗口内的数据
-                    2. **计算统计量**：窗口内中位数(median)和MAD
-                    3. **标准化**：计算标准化残差 z = 0.6745 * (x - median) / MAD
-                    4. **判断异常**：|z| > k 时判定为异常值（k通常取3.0）
-                    5. **替换处理**：异常值替换为窗口中位数
-                    
-                    **优点**：
-                    - ✅ 对异常值不敏感
-                    - ✅ 无需假设数据分布
-                    - ✅ 保留真实数据趋势
-                    
-                    **稳健统计量**：
-                    - **稳健平均值**：清洁后数据的算术平均
-                    - **稳健标准差(清洁数据)**：最可靠的方法
-                    - **MAD稳健标准差**：基于全局MAD，数据重复时可能为0
-                    - **IQR稳健标准差**：四分位距方法，适合任何数据
-                    
-                    **参数说明**：
-                    - **k值**：敏感度阈值，越小越敏感
-                    - **窗口大小**：局部统计范围，必须为奇数
+                    **Hampel滤波器**是一种基于中位数和MAD的稳健统计方法...
                     """)
                     
-                # 异常值详情
-                if outliers:
+                # 异常值详情 - 修复判断
+                if len(outliers) > 0:  # ✅ 修复：使用len()判断
                     st.subheader("🚨 异常值详情")
                     outlier_df = df.iloc[outliers][[
                         col_to_analyze, '清洁值', '中位数', 'MAD', '是否异常'
@@ -366,6 +322,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
